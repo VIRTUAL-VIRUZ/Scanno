@@ -51,6 +51,7 @@ stripe==12.3.0
 typing-inspection==0.4.1
 typing_extensions==4.14.1
 urllib3==2.5.0
+# urllib.parse (standard library)
 uvicorn==0.35.0
 wheel==0.45.1
 itsdangerous
